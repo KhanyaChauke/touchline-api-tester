@@ -1,16 +1,43 @@
-"""Ids as stored by Touchline sync (Sports Monks conventions), verified against TouchLineDB."""
-SIM_BASE = 9_000_000_000  # every simulated sportmonks_* id is >= this, so cleanup is exact
+"""Ids and constants as defined by Touchline sync (Sportmonks conventions) and touchline-sim rules."""
 
-# match_events.type_id
-GOAL, OWN_GOAL, PENALTY, MISSED_PENALTY = 14, 15, 16, 17
-SUBSTITUTION, YELLOW, RED, YELLOW_RED, VAR = 18, 19, 20, 21, 10
+# ID Base ranges
+FIXTURE_BASE = 9_000_000_000
+LINEUP_BASE  = 9_100_000_000
+EVENT_BASE   = 9_200_000_000
 
-# fixtures.state_id
-NOT_STARTED, FIRST_HALF, HALF_TIME, FULL_TIME = 1, 2, 3, 5
-POSTPONED, ABANDONED, SECOND_HALF = 10, 15, 22  # 2/3/22 are standard Sports Monks, not yet seen in your data
+# Legacy compatibility
+SIM_BASE = FIXTURE_BASE
 
-# player_lineups.type_id / position_id
-STARTER, BENCH = 11, 12
-GK, DEF, MID, ATT = 24, 25, 26, 27
+# Fixture States (from touchline-api core states matrix)
+NOT_STARTED = 1
+FIRST_HALF  = 2
+HALF_TIME   = 3
+BREAK       = 4
+SECOND_HALF = 22
+FULL_TIME   = 5
+POSTPONED   = 10
+ABANDONED   = 15
+INTERRUPTED = 18
+
+# Event Types
+GOAL            = 14
+OWN_GOAL        = 15
+PENALTY         = 16
+MISSED_PENALTY  = 17
+SUBSTITUTION    = 18
+YELLOW          = 19
+RED             = 20
+YELLOW_RED      = 21
+VAR             = 10
 
 GOAL_TYPES = (GOAL, PENALTY)
+
+# Lineup Types
+STARTER = 11
+BENCH   = 12
+
+# Positions
+GK  = 24
+DEF = 25
+MID = 26
+ATT = 27

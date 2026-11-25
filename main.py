@@ -1,102 +1,182 @@
+"""
+Railway Web Server and CLI entrypoint for touchline-sim.
+Supports HTTP endpoints protected by X-Sim-Key header:
+- POST /sim/start
+- POST /sim/stop
+- GET  /sim/status
+- GET  /sim/report
+"""
+
 import os
 import sys
 import json
-import io
-import contextlib
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from sim.cli import main as sim_main
-from sim.engine import SCENARIOS
+from typing import Optional, Dict, Any
 
-class SimHandler(BaseHTTPRequestHandler):
+from sim.cli import main as sim_main
+from sim.scenarios import SCENARIO_CATALOG
+from sim.tester import run_simulation
+from sim.safety import check_safety, SafetyViolationError
+
+# Global simulation state
+CURRENT_SIM_STATE: Dict[str, Any] = {
+    "status": "idle",
+    "scenario": None,
+    "fixture_no": None,
+    "current_minute": 0,
+    "last_result": None,
+    "last_report": None
+}
+SIM_STOP_REQUESTED = False
+SIM_THREAD: Optional[threading.Thread] = None
+
+class SimRequestHandler(BaseHTTPRequestHandler):
+    def _check_auth(self) -> bool:
+        expected_key = os.environ.get("SIM_KEY", os.environ.get("X_SIM_KEY", "touchline-secret-key"))
+        client_key = self.headers.get("X-Sim-Key", "")
+        return client_key == expected_key
+
+    def _send_json(self, status_code: int, data: Dict[str, Any]):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2).encode("utf-8"))
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        params = parse_qs(parsed.query)
 
+        # Unprotected healthcheck endpoints for Railway
         if path in ("/", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            resp = {
+            self._send_json(200, {
                 "status": "healthy",
                 "service": "touchline-sim",
-                "scenarios": list(SCENARIOS.keys()),
-                "usage": "GET /run?scenario=var_disallowed&offline=true"
-            }
-            self.wfile.write(json.dumps(resp, indent=2).encode("utf-8"))
+                "sim_status": CURRENT_SIM_STATE["status"],
+                "scenarios_available": list(SCENARIO_CATALOG.keys()),
+                "endpoints": [
+                    "POST /sim/start (Header: X-Sim-Key)",
+                    "POST /sim/stop  (Header: X-Sim-Key)",
+                    "GET  /sim/status (Header: X-Sim-Key)",
+                    "GET  /sim/report (Header: X-Sim-Key)"
+                ]
+            })
             return
 
         if path == "/scenarios":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(SCENARIOS, indent=2).encode("utf-8"))
+            self._send_json(200, {k: v.description for k, v in SCENARIO_CATALOG.items()})
             return
 
-        if path == "/run":
-            scenario = params.get("scenario", [os.environ.get("SIM_SCENARIO", "var_disallowed")])[0]
-            is_offline = "offline" in params or not os.environ.get("DATABASE_URL")
-            speed = params.get("speed", ["0"])[0]
-            seed = params.get("seed", ["7"])[0]
+        # Protected endpoints require X-Sim-Key
+        if not self._check_auth():
+            self._send_json(401, {"error": "Unauthorized: valid X-Sim-Key header required"})
+            return
 
-            args = ["run", "--seed", seed, "--speed", speed, "-s", scenario]
-            if is_offline:
-                args.append("--offline")
+        if path == "/sim/status":
+            self._send_json(200, CURRENT_SIM_STATE)
+            return
+
+        if path == "/sim/report":
+            if CURRENT_SIM_STATE.get("last_report"):
+                self._send_json(200, CURRENT_SIM_STATE["last_report"])
             else:
-                args.append("--write")
-
-            out = io.StringIO()
-            err = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    sim_main(args)
-                status_code = 200
-                result = {"status": "success", "output": out.getvalue()}
-            except SystemExit as se:
-                status_code = 500 if se.code != 0 else 200
-                result = {
-                    "status": "exit" if se.code == 0 else "error",
-                    "code": str(se.code),
-                    "output": out.getvalue(),
-                    "error": err.getvalue()
-                }
-            except Exception as e:
-                status_code = 500
-                result = {"status": "exception", "error": str(e), "output": out.getvalue()}
-
-            self.send_response(status_code)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(result, indent=2).encode("utf-8"))
+                self._send_json(404, {"error": "No simulation report available yet."})
             return
 
-        self.send_response(404)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps({"error": "not found"}).encode("utf-8"))
+        self._send_json(404, {"error": "Not Found"})
 
-    def log_message(self, format, *args):
-        print(f"[{self.log_date_time_string()}] {args[0]} {args[1]} {args[2]}")
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
 
-def run_server(port):
-    server = HTTPServer(("0.0.0.0", port), SimHandler)
-    print(f"Server listening on http://0.0.0.0:{port}")
+        if not self._check_auth():
+            self._send_json(401, {"error": "Unauthorized: valid X-Sim-Key header required"})
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = {}
+        if content_length > 0:
+            try:
+                body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            except Exception:
+                body = {}
+
+        if path == "/sim/start":
+            global SIM_THREAD, SIM_STOP_REQUESTED
+            if CURRENT_SIM_STATE["status"] == "running":
+                self._send_json(409, {"error": "A simulation is already running", "state": CURRENT_SIM_STATE})
+                return
+
+            scenario = body.get("scenario", "var_disallowed")
+            fixture_no = int(body.get("fixtureNo", body.get("fixture_no", 1)))
+            speed = float(body.get("speed", 0.0))
+            seed = int(body.get("seed", 1))
+            offline = bool(body.get("offline", not bool(os.environ.get("DATABASE_URL"))))
+            write = bool(body.get("write", not offline))
+
+            SIM_STOP_REQUESTED = False
+            CURRENT_SIM_STATE.update({
+                "status": "running",
+                "scenario": scenario,
+                "fixture_no": fixture_no,
+                "current_minute": 0
+            })
+
+            def worker():
+                try:
+                    res = run_simulation(
+                        fixture_no=fixture_no,
+                        scenarios=[scenario],
+                        speed=speed,
+                        seed=seed,
+                        offline=offline,
+                        write=write
+                    )
+                    CURRENT_SIM_STATE["status"] = "idle"
+                    CURRENT_SIM_STATE["last_result"] = "completed"
+                    CURRENT_SIM_STATE["last_report"] = res
+                except Exception as e:
+                    CURRENT_SIM_STATE["status"] = "error"
+                    CURRENT_SIM_STATE["last_result"] = str(e)
+
+            SIM_THREAD = threading.Thread(target=worker, daemon=True)
+            SIM_THREAD.start()
+
+            self._send_json(202, {
+                "message": "Simulation started",
+                "scenario": scenario,
+                "fixtureNo": fixture_no,
+                "offline": offline
+            })
+            return
+
+        if path == "/sim/stop":
+            SIM_STOP_REQUESTED = True
+            CURRENT_SIM_STATE["status"] = "idle"
+            CURRENT_SIM_STATE["last_result"] = "stopped by user"
+            self._send_json(200, {"message": "Simulation stop requested"})
+            return
+
+        self._send_json(404, {"error": "Not Found"})
+
+def run_server(port: int):
+    # Safety check on server start
+    check_safety()
+    server = HTTPServer(("0.0.0.0", port), SimRequestHandler)
+    print(f"Touchline Sim server listening on port {port}...")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         server.server_close()
 
 if __name__ == "__main__":
-    # If explicit CLI arguments were passed (e.g., python main.py run ...), run CLI directly
     if len(sys.argv) > 1:
         sys.exit(sim_main())
 
-    # Railway / cloud environments always inject the PORT variable
     port_env = os.environ.get("PORT")
     if port_env:
         run_server(int(port_env))
     else:
-        # Local fallback: run the offline test simulation
-        print("PORT environment variable not set. Running offline simulation dry run...")
+        print("PORT environment variable not set. Running default offline test scenario...")
         sys.exit(sim_main(["run", "--offline", "--seed", "7", "-s", "var_disallowed"]))
